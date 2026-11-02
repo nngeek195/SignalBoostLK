@@ -2,7 +2,7 @@
 
 **ISP Monitor • Speed Test • Network Insights**
 
-SignalBoostLK is a desktop network monitoring and ISP-specific download speed testing application designed for Sri Lankan internet users.
+SignalBoostLK is a desktop network monitoring and ISP-specific download speed boosting application designed for Sri Lankan internet users.
 
 It helps users monitor their internet connection, identify their ISP and measure download performance using ISP-specific Ookla speed test servers.
 
