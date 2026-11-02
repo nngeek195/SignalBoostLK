@@ -1,40 +1,130 @@
-# SignalBoostLK — Linux Edition
+# SignalBoostLK
 
-A desktop ISP monitor and ISP-specific download tester.
+**ISP Monitor • Speed Test • Network Insights**
 
-## Requirements
-- Ubuntu 24.04+ (or another modern Linux desktop)
-- Python 3.10+
-- Internet connection
+SignalBoostLK is a desktop network monitoring and ISP-specific download speed testing application designed for Sri Lankan internet users.
 
-## Install
+It helps users monitor their internet connection, identify their ISP and measure download performance using ISP-specific Ookla speed test servers.
+
+## Features
+
+- Automatic ISP detection.
+- Manual ISP selection.
+- Support for Mobitel, Dialog, SLT and Hutch.
+- ISP-specific download speed testing.
+- Continuous network monitoring.
+- Configurable testing intervals.
+- Download speed measurements in Mbps.
+- Test history and network insights.
+- Modern desktop interface.
+
+## Supported ISPs
+
+| ISP | Speed Test Server |
+|---|---|
+| Mobitel | Mobitel Ookla |
+| Dialog | Dialog Ookla |
+| SLT | SLT Ookla |
+| Hutch | Hutch Ookla |
+
+## Download
+
+### Linux (Ubuntu / Debian)
+
+Download the `.deb` package:
+
 ```bash
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip
-cd SignalBoostLK
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-python main.py
+wget -O signalboostlk.deb \
+"https://raw.githubusercontent.com/nngeek195/SignalBoostLK/main/Download/signalboostlk_0.1.0_amd64.deb"
 ```
 
-## Usage
-1. Open the application.
-2. Click **Detect ISP** to identify the current public IP and provider (optional).
-3. Leave the ISP selector on **Auto-detect**, or pick Mobitel, Dialog, SLT or Hutch. A manual choice always takes priority over detection.
-4. Set the test size and the interval between tests in Settings (default 25 MB every 60 s). The Settings page shows the worst-case data use per hour.
-5. Click **Start monitoring**. The first test starts immediately.
-6. Click **Stop** to stop monitoring. A download in progress is cancelled right away.
+Install SignalBoostLK:
 
-## ISP endpoints
-The endpoints are read from `app/config/isps.json`. Edit that file to change or add servers. They are based on the supplied PowerShell script. ISP server availability, DNS, TLS certificates and endpoint behaviour can change. A successful HTTP request is required before a result is saved.
+```bash
+sudo apt install ./signalboostlk.deb
+```
 
-## Data and privacy
-- Test history is stored locally in `~/.local/share/SignalBoostLK/history.db`.
-- ISP detection uses `https://ipinfo.io/json` and therefore sends a request to that service.
-- The app does not collect credentials or require administrator/root privileges.
-- Download tests consume data. Configure a smaller test size if you are on a metered connection.
+Launch the application:
 
-## Notes
-This is an initial Linux MVP. ISP identification depends on provider metadata returned by the IP lookup service; manual selection is provided as a fallback. Download speed is measured as payload bytes received divided by elapsed time, in decimal Mbps.
+```bash
+signalboostlk
+```
+
+### Windows
+
+Download the latest Windows build from GitHub Actions:
+
+[Download SignalBoostLK for Windows](https://github.com/nngeek195/SignalBoostLK/actions/runs/41466118253/artifacts/13153166422)
+
+The downloaded artifact is a ZIP file. Extract it and run:
+
+```text
+SignalBoostLK.exe
+```
+
+Alternatively, download it using GitHub CLI.
+
+Install GitHub CLI and authenticate:
+
+```bash
+sudo apt install gh -y
+gh auth login
+```
+
+Download the Windows executable:
+
+```bash
+gh run download 41466118253 \
+  --repo nngeek195/SignalBoostLK \
+  --name SignalBoostLK-Windows \
+  --dir SignalBoostLK-Windows
+```
+
+The executable will be available inside:
+
+```text
+SignalBoostLK-Windows/SignalBoostLK.exe
+```
+
+## How to Use
+
+1. Open SignalBoostLK.
+2. Allow the application to detect your ISP automatically.
+3. Select an ISP manually if automatic detection is unavailable.
+4. Configure the monitoring interval.
+5. Start monitoring.
+6. View download speed results and network history.
+7. Stop monitoring whenever you want.
+
+**Note:** Frequent speed tests consume internet data. Choose an appropriate testing interval, especially when using a mobile data connection.
+
+## Technology Stack
+
+- Python
+- PySide6
+- Qt
+- HTTPX
+- SQLite
+- PyInstaller
+- GitHub Actions
+
+## Build Automation
+
+Windows builds are automatically generated using GitHub Actions.
+
+Workflow:
+
+- Triggered when code is pushed to `main`.
+- Can also be started manually.
+- Builds the Windows executable.
+- Uploads the executable as a downloadable workflow artifact.
+
+[View GitHub Actions](https://github.com/nngeek195/SignalBoostLK/actions)
+
+## Project Repository
+
+[GitHub – SignalBoostLK](https://github.com/nngeek195/SignalBoostLK)
+
+## License
+
+See the repository for license information.
