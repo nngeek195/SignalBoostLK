@@ -1,0 +1,6 @@
+{
+  "Mobitel": "https://speedtest2.mobitel.lk.prod.hosts.ooklaserver.net:8080",
+  "Dialog": "https://ookla1.dialog.lk.prod.hosts.ooklaserver.net:8080",
+  "SLT": "https://hqspeedtest1.slt.lk.prod.hosts.ooklaserver.net:8080",
+  "Hutch": "https://wplsp.hutch.lk.prod.hosts.ooklaserver.net:8080"
+}
