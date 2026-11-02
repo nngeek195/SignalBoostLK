@@ -1,0 +1,81 @@
+
+name: SignalBoostLK Windows Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build application
+        shell: pwsh
+        run: |
+          python -m PyInstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name SignalBoostLK `
+            --collect-all PySide6 `
+            --collect-all shiboken6 `
+            --add-data "app/ui/assets;app/ui/assets" `
+            --add-data "app/config;app/config" `
+            main.py
+
+      - name: Upload Windows executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: SignalBoostLK-Windows
+          path: dist/SignalBoostLK.exe
+          if-no-files-found: error
+          retention-days: 30
+        
+      - name: Copy EXE to Download folder
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path Download
+          Copy-Item dist/SignalBoostLK.exe Download/SignalBoostLK.exe
+
+      - name: Commit EXE to repository
+        if: github.event_name != 'pull_request'
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Download/SignalBoostLK.exe
+
+          git commit -m "Update Windows executable [skip ci]" `
+            || echo "No changes to commit"
+
+          git push
+

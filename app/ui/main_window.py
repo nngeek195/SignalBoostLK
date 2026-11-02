@@ -560,7 +560,7 @@ class MainWindow(QMainWindow):
         self.size_spin.setFixedWidth(180)
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(5, 3600)
-        self.interval_spin.setValue(60)
+        self.interval_spin.setValue(5)
         self.interval_spin.setSuffix(" s")
         self.interval_spin.setFixedWidth(180)
         form.addRow(label("Download test size", "muted"), self.size_spin)
