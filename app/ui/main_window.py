@@ -1,22 +1,34 @@
+"""SignalBoostLK 2.0 desktop UI — connection keeper dashboard.
+
+No speed values are shown: the keeper only sends lightweight heartbeats.
+"""
+import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QThread, QTimer, QUrl, Signal
-from PySide6.QtGui import (
-    QColor, QDesktopServices, QFont, QIcon, QPainter, QPainterPath, QPalette, QPen,
-)
+from PySide6.QtCore import QSize, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QComboBox, QFormLayout, QFrame,
     QGridLayout, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QSizePolicy, QSpinBox, QStackedWidget, QStyleFactory,
-    QTableWidget, QTableWidgetItem, QToolTip, QVBoxLayout, QWidget,
+    QPushButton, QSpinBox, QStackedWidget, QStyleFactory,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
-from app.core.download_engine import SUPPORTED_ISPS
-from app.core.isp_detector import detect_current_isp
-from app.core.monitor_worker import AUTO, MonitorWorker
-from app.database.db import clear_history, recent_tests
+from app.core.config import load_isps
+from app.core.isp_detector import UNKNOWN, detect_current_isp
+from app.core.keeper import (HANDSHAKE_BYTES, SERVER_IDLE_TIMEOUT_S,
+                             SERVER_MAX_CONNECTION_AGE_S, State)
+from app.core.monitor_worker import AUTO, KeeperController
+from app.database import db
 
+APP_VERSION = "2.0.0"
+SERVERS = load_isps()
+SUPPORTED_ISPS = tuple(SERVERS)
+DEFAULT_INTERVAL_S = 10
+# Measured per-heartbeat cost (docs/reports/stage2_endpoint_compatibility.md)
+COST_REUSED_B = 800
+COST_RECONNECT_B = 6100
 ASSETS = (Path(__file__).resolve().parent / "assets").as_posix()
 
 # ── Developer links ──────────────────────────────────────────────────────────
@@ -123,7 +135,7 @@ def apply_theme(app: QApplication):
     ):
         pal.setColor(role, QColor(color))
     app.setPalette(pal)
-    app.setStyleSheet(QSS)
+    app.setStyleSheet(QSS + EXTRA_QSS)
 
 
 # ── Small building blocks ────────────────────────────────────────────────────
@@ -186,139 +198,82 @@ class InfoTile(QFrame):
         lay.addStretch()
 
 
-class SpeedChart(QWidget):
-    """Single-series line chart of recent download speeds (oldest → newest)."""
 
-    def __init__(self):
-        super().__init__()
-        self.points = []  # list of (label, mbps, isp)
-        self.setMinimumHeight(150)
-        self.setMouseTracking(True)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        self._hover = None
+EXTRA_QSS = """
+QLabel#stateBig { font-size: 34px; font-weight: 800; }
+"""
 
-    def set_points(self, points):
-        self.points = points
-        self._hover = None
-        self.update()
 
-    def _geometry(self):
-        r = QRectF(self.rect()).adjusted(44, 10, -12, -24)
-        top = max((p[1] for p in self.points), default=0)
-        top = self._nice_ceiling(top)
-        return r, top
+def fmt_bytes(n):
+    if n is None:
+        return "—"
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
 
-    @staticmethod
-    def _nice_ceiling(v):
-        if v <= 0:
-            return 10.0
-        for step in (1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000):
-            if v <= step * 4:
-                return float(step * 4) if v > step * 3 else float(step * (int(v // step) + 1))
-        return float(int(v) + 1)
 
-    def _xy(self, i, v, r, top):
-        n = len(self.points)
-        x = r.left() + (r.width() * (i / (n - 1)) if n > 1 else r.width() / 2)
-        y = r.bottom() - r.height() * (v / top)
-        return QPointF(x, y)
+def fmt_duration(seconds):
+    if seconds is None:
+        return "—"
+    s = int(seconds)
+    h, rem = divmod(s, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h {m:02d}m {s:02d}s" if h else (f"{m}m {s:02d}s" if m else f"{s}s")
 
-    def paintEvent(self, _):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        r, top = self._geometry()
-        small = QFont(self.font())
-        small.setPointSizeF(max(7.5, small.pointSizeF() - 2))
-        p.setFont(small)
 
-        # Recessive grid + y labels.
-        for k in range(5):
-            v = top * k / 4
-            y = r.bottom() - r.height() * k / 4
-            p.setPen(QPen(QColor(BORDER), 1))
-            p.drawLine(QPointF(r.left(), y), QPointF(r.right(), y))
-            p.setPen(QColor(MUTED))
-            p.drawText(QRectF(0, y - 8, r.left() - 8, 16),
-                       Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, f"{v:g}")
+def fmt_ts(ts, short=False):
+    if not ts:
+        return "—"
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S" if short else "%Y-%m-%d  %H:%M:%S")
 
-        if not self.points:
-            p.setPen(QColor(MUTED))
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, "No tests yet — results will appear here")
-            return
 
-        pts = [self._xy(i, v, r, top) for i, (_, v, _) in enumerate(self.points)]
-
-        # Soft area fill under the line.
-        if len(pts) > 1:
-            area = QPainterPath(QPointF(pts[0].x(), r.bottom()))
-            for pt in pts:
-                area.lineTo(pt)
-            area.lineTo(QPointF(pts[-1].x(), r.bottom()))
-            fill = QColor(CHART)
-            fill.setAlpha(28)
-            p.fillPath(area, fill)
-            line = QPainterPath(pts[0])
-            for pt in pts[1:]:
-                line.lineTo(pt)
-            p.setPen(QPen(QColor(CHART), 2, Qt.PenStyle.SolidLine,
-                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            p.drawPath(line)
-
-        # Markers: the latest point always, plus the hovered one.
-        for i in {len(pts) - 1, self._hover} - {None}:
-            p.setPen(QPen(QColor(SURFACE), 2))
-            p.setBrush(QColor(CHART))
-            p.drawEllipse(pts[i], 4.5, 4.5)
-
-        # X labels: first and last only, to avoid collisions.
-        p.setPen(QColor(MUTED))
-        p.drawText(QRectF(r.left(), r.bottom() + 6, 120, 16), Qt.AlignmentFlag.AlignLeft,
-                   self.points[0][0])
-        if len(pts) > 1:
-            p.drawText(QRectF(r.right() - 120, r.bottom() + 6, 120, 16),
-                       Qt.AlignmentFlag.AlignRight, self.points[-1][0])
-
-        if self._hover is not None:
-            p.setPen(QPen(QColor(MUTED), 1, Qt.PenStyle.DashLine))
-            x = pts[self._hover].x()
-            p.drawLine(QPointF(x, r.top()), QPointF(x, r.bottom()))
-
-    def mouseMoveEvent(self, e):
-        if not self.points:
-            return
-        r, top = self._geometry()
-        xs = [self._xy(i, v, r, top).x() for i, (_, v, _) in enumerate(self.points)]
-        i = min(range(len(xs)), key=lambda k: abs(xs[k] - e.position().x()))
-        if i != self._hover:
-            self._hover = i
-            when, mbps, isp = self.points[i]
-            QToolTip.showText(e.globalPosition().toPoint(),
-                              f"<b>{mbps:.2f} Mbps</b><br>{isp} · {when}", self)
-            self.update()
-
-    def leaveEvent(self, _):
-        self._hover = None
-        QToolTip.hideText()
-        self.update()
+def estimate_per_hour(interval_s):
+    """Measured model: below the idle timeout one connection lasts ~60 s, so
+    a handshake is paid once per minute; above it, on every heartbeat."""
+    beats = 3600 / interval_s
+    if interval_s < SERVER_IDLE_TIMEOUT_S:
+        return beats * COST_REUSED_B + (3600 / SERVER_MAX_CONNECTION_AGE_S) * sum(HANDSHAKE_BYTES)
+    return beats * COST_RECONNECT_B
 
 
 class DetectWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
 
+    def __init__(self, parent=None, force=False):
+        super().__init__(parent)
+        self.force = force
+
     def run(self):
         try:
-            self.done.emit(detect_current_isp())
+            self.done.emit(detect_current_isp(force=self.force))
         except Exception as exc:
             self.failed.emit(f"ISP detection failed: {exc}")
 
 
-def fmt_time(iso, short=False):
-    try:
-        dt = datetime.fromisoformat(iso)
-    except ValueError:
-        return iso
-    return dt.strftime("%H:%M" if short else "%Y-%m-%d  %H:%M:%S")
+def make_table(headers):
+    t = QTableWidget(0, len(headers))
+    t.setHorizontalHeaderLabels(headers)
+    hh = t.horizontalHeader()
+    hh.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+    hh.setStretchLastSection(True)
+    hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    hh.setHighlightSections(False)
+    t.verticalHeader().setVisible(False)
+    t.verticalHeader().setDefaultSectionSize(36)
+    t.setShowGrid(False)
+    t.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+    t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+    t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+    return t
+
+
+def fill_table(table, rows):
+    table.setRowCount(len(rows))
+    for r, values in enumerate(rows):
+        for c, v in enumerate(values):
+            table.setItem(r, c, QTableWidgetItem(str(v)))
 
 
 # ── Main window ──────────────────────────────────────────────────────────────
@@ -326,18 +281,23 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SignalBoostLK")
-        self.resize(1200, 780)
-        self.setMinimumSize(980, 680)
-        self.worker = None
+        self.resize(1200, 800)
+        self.setMinimumSize(1000, 700)
+        self.controller = None
         self.detect_worker = None
         self._closing = False
-        self._countdown = 0
-        self._last_failed = False
+        self._pending_start = False
+        self._detected_isp = None
         self._tick = QTimer(self)
         self._tick.setInterval(1000)
-        self._tick.timeout.connect(self._on_tick)
+        self._tick.timeout.connect(self._refresh_live)
         self._build_ui()
-        self.refresh_history()
+        self._load_prefs()
+        self._refresh_live()
+        try:
+            db.prune()
+        except Exception:
+            pass
 
     # ── Layout ───────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -348,9 +308,9 @@ class MainWindow(QMainWindow):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(self._sidebar())
-
         self.pages = QStackedWidget()
-        for build in (self._overview_page, self._history_page, self._settings_page):
+        for build in (self._dashboard_page, self._history_page, self._events_page,
+                      self._settings_page):
             self.pages.addWidget(build())
         outer.addWidget(self.pages, 1)
 
@@ -361,16 +321,15 @@ class MainWindow(QMainWindow):
         side = QVBoxLayout(sidebar)
         side.setContentsMargins(16, 24, 16, 18)
         side.setSpacing(4)
-
         brand = label(f"SignalBoost<span style='color:{ACCENT_HOVER}'>LK</span>", "brand")
         brand.setTextFormat(Qt.TextFormat.RichText)
         side.addWidget(brand)
-        side.addWidget(label("ISP MONITOR · SPEED TEST", "tagline"))
+        side.addWidget(label("ISP CONNECTION KEEPER", "tagline"))
         side.addSpacing(28)
-
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
-        for idx, text in enumerate(("Overview", "Test history", "Settings")):
+        for idx, text in enumerate(("Dashboard", "Session history", "Connection events",
+                                    "Settings")):
             btn = QPushButton(text)
             btn.setObjectName("nav")
             btn.setCheckable(True)
@@ -379,7 +338,6 @@ class MainWindow(QMainWindow):
             side.addWidget(btn)
         self.nav_group.button(0).setChecked(True)
         self.nav_group.idClicked.connect(self._go_to)
-
         side.addStretch()
         side.addWidget(label("DEVELOPER", "footerTitle"))
         side.addSpacing(4)
@@ -393,7 +351,7 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(lambda _=False, u=url: QDesktopServices.openUrl(QUrl(u)))
             side.addWidget(btn)
         side.addSpacing(14)
-        side.addWidget(label("Linux edition · v0.1.0", "muted"))
+        side.addWidget(label(f"v{APP_VERSION}", "muted"))
         return sidebar
 
     def _page(self):
@@ -401,71 +359,65 @@ class MainWindow(QMainWindow):
         page.setObjectName("page")
         lay = QVBoxLayout(page)
         lay.setContentsMargins(32, 28, 32, 28)
-        lay.setSpacing(18)
+        lay.setSpacing(16)
         return page, lay
 
-    def _overview_page(self):
+    def _dashboard_page(self):
         page, layout = self._page()
         self.badge = Pill()
-        self.badge.set_state("IDLE", WARN)
+        self.badge.set_state("STOPPED", MUTED)
         layout.addLayout(page_header(
-            "Network overview",
-            "Monitor your ISP connection and measure download performance.",
-            self.badge,
-        ))
+            "Connection keeper",
+            "Keeps one lightweight HTTPS connection to your ISP's speed-test server. "
+            "No speed tests, no large downloads.",
+            self.badge))
 
-        # Hero: latest speed + trend chart.
-        hero = card()
-        h = QHBoxLayout(hero)
-        h.setContentsMargins(24, 20, 24, 20)
-        h.setSpacing(28)
+        # Status card
+        status = card()
+        s = QHBoxLayout(status)
+        s.setContentsMargins(24, 20, 24, 20)
         left = QVBoxLayout()
-        left.setSpacing(2)
-        left.addWidget(label("LAST DOWNLOAD", "eyebrow"))
-        num_row = QHBoxLayout()
-        num_row.setSpacing(8)
-        self.speed_value = label("—", "hero")
-        num_row.addWidget(self.speed_value, alignment=Qt.AlignmentFlag.AlignBottom)
-        num_row.addWidget(label("Mbps", "heroUnit"), alignment=Qt.AlignmentFlag.AlignBottom)
-        num_row.addStretch()
-        left.addLayout(num_row)
-        self.speed_detail = label("No completed test yet", "muted")
-        left.addWidget(self.speed_detail)
-        left.addSpacing(10)
-        self.stats_label = label("", "muted")
-        left.addWidget(self.stats_label)
-        left.addStretch()
-        lw = QWidget()
-        lw.setLayout(left)
-        lw.setFixedWidth(250)
-        h.addWidget(lw)
-
+        left.setSpacing(4)
+        left.addWidget(label("CONNECTION STATUS", "eyebrow"))
+        self.state_label = label("Stopped", "stateBig")
+        left.addWidget(self.state_label)
+        self.server_label = label("Server: —", "muted")
+        self.server_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        left.addWidget(self.server_label)
+        s.addLayout(left, 1)
         right = QVBoxLayout()
-        right.setSpacing(6)
-        right.addWidget(label("RECENT SPEED (Mbps)", "eyebrow"))
-        self.chart = SpeedChart()
-        right.addWidget(self.chart, 1)
-        h.addLayout(right, 1)
-        layout.addWidget(hero, 3)
+        right.setSpacing(4)
+        right.addWidget(label("CURRENT CONNECTION OPEN FOR", "eyebrow"))
+        self.conn_age_label = label("—", "metric")
+        right.addWidget(self.conn_age_label)
+        self.session_label = label("Monitoring time: —", "muted")
+        right.addWidget(self.session_label)
+        s.addLayout(right)
+        layout.addWidget(status)
 
-        # Info tiles.
-        tiles = QGridLayout()
-        tiles.setSpacing(14)
-        self.isp_tile = InfoTile("Current ISP", "Unknown", "Detect or select an ISP")
-        self.ip_tile = InfoTile("Public IP", "—", "Not detected yet")
-        self.org_tile = InfoTile("Organization", "—", "From ipinfo.io")
-        self.org_tile.value.setStyleSheet("font-size:15px;")
-        self.org_tile.value.setWordWrap(True)
-        for i, tile in enumerate((self.isp_tile, self.ip_tile, self.org_tile)):
-            tiles.addWidget(tile, 0, i)
-            tiles.setColumnStretch(i, 1)
-        layout.addLayout(tiles)
+        # Metric tiles
+        grid = QGridLayout()
+        grid.setSpacing(12)
+        self.t_isp = InfoTile("Selected ISP", "—", "Auto-detect or choose below")
+        self.t_last = InfoTile("Last heartbeat", "—", "No heartbeat yet")
+        self.t_rtt = InfoTile("Avg response time", "—", "—")
+        self.t_beats = InfoTile("Heartbeats", "0", "0 failed")
+        self.t_reconn = InfoTile("Reconnections", "0", "0 reused requests")
+        self.t_data = InfoTile("Data used (est.)", "0 B", "This session")
+        self.t_rate = InfoTile("Data per hour (est.)", "—", "Measured after 1 minute")
+        self.t_today = InfoTile("Data last 24 h (est.)", "—", "All sessions")
+        for i, tile in enumerate((self.t_isp, self.t_last, self.t_rtt, self.t_beats,
+                                  self.t_reconn, self.t_data, self.t_rate, self.t_today)):
+            grid.addWidget(tile, i // 4, i % 4)
+        for c in range(4):
+            grid.setColumnStretch(c, 1)
+        layout.addLayout(grid)
 
-        # Controls + progress.
+        # Controls
         ctl = card()
         c = QVBoxLayout(ctl)
-        c.setContentsMargins(24, 20, 24, 20)
-        c.setSpacing(14)
+        c.setContentsMargins(24, 18, 24, 18)
+        c.setSpacing(12)
         row = QHBoxLayout()
         row.setSpacing(10)
         row.addWidget(label("ISP", "muted"))
@@ -473,7 +425,7 @@ class MainWindow(QMainWindow):
         self.isp_combo.addItems([AUTO, *SUPPORTED_ISPS])
         row.addWidget(self.isp_combo)
         self.detect_button = QPushButton("Detect ISP")
-        self.detect_button.clicked.connect(self.detect_isp)
+        self.detect_button.clicked.connect(lambda: self.detect_isp(force=True))
         row.addWidget(self.detect_button)
         row.addStretch()
         self.start_button = QPushButton("Start monitoring")
@@ -488,87 +440,80 @@ class MainWindow(QMainWindow):
         row.addWidget(self.start_button)
         row.addWidget(self.stop_button)
         c.addLayout(row)
-
-        line = QFrame()
-        line.setFixedHeight(1)
-        line.setStyleSheet(f"background:{BORDER};")
-        c.addWidget(line)
-
-        prog_head = QHBoxLayout()
-        prog_head.addWidget(label("Download test", "h2"))
-        prog_head.addStretch()
-        self.test_state = label("Ready", "muted")
-        prog_head.addWidget(self.test_state)
-        c.addLayout(prog_head)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setTextVisible(False)
-        c.addWidget(self.progress)
-        self.status_label = label("Ready. Press Start monitoring to run the first test.", "muted", wrap=True)
+        self.status_label = label("Ready.", "muted", wrap=True)
         c.addWidget(self.status_label)
         layout.addWidget(ctl)
+
+        # Live log
+        logcard = card()
+        lc = QVBoxLayout(logcard)
+        lc.setContentsMargins(6, 10, 6, 6)
+        lc.addWidget(label("   LIVE EVENTS", "eyebrow"))
+        self.live_table = make_table(["TIME", "EVENT", "DETAIL"])
+        lc.addWidget(self.live_table)
+        layout.addWidget(logcard, 1)
         return page
 
     def _history_page(self):
         page, layout = self._page()
         clear_btn = QPushButton("Clear history")
         clear_btn.clicked.connect(self._clear_history)
-        layout.addLayout(page_header(
-            "Test history", "Your latest completed download tests, stored locally.", clear_btn))
-
+        layout.addLayout(page_header("Session history",
+                                     "Monitoring sessions and their data usage, stored locally.",
+                                     clear_btn))
         panel = card()
         p = QVBoxLayout(panel)
         p.setContentsMargins(6, 6, 6, 6)
-        self.history_table = QTableWidget(0, 5)
-        self.history_table.setHorizontalHeaderLabels(
-            ["DATE / TIME", "ISP", "DOWNLOAD", "SIZE", "DURATION"])
-        hh = self.history_table.horizontalHeader()
-        hh.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        hh.setHighlightSections(False)
-        self.history_table.verticalHeader().setVisible(False)
-        self.history_table.verticalHeader().setDefaultSectionSize(42)
-        self.history_table.setShowGrid(False)
-        self.history_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.history_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.history_table = make_table(["STARTED", "DURATION", "ISP", "HEARTBEATS OK",
+                                         "FAILED", "RECONNECTS", "DATA (EST.)", "AVG RESPONSE"])
         p.addWidget(self.history_table)
-        self.history_empty = label("No tests recorded yet.", "muted")
-        self.history_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        p.addWidget(self.history_empty)
+        layout.addWidget(panel, 1)
+        return page
+
+    def _events_page(self):
+        page, layout = self._page()
+        layout.addLayout(page_header("Connection events",
+                                     "Connections, reconnections, failures and state changes."))
+        panel = card()
+        p = QVBoxLayout(panel)
+        p.setContentsMargins(6, 6, 6, 6)
+        self.events_table = make_table(["TIME", "EVENT", "DETAIL"])
+        p.addWidget(self.events_table)
         layout.addWidget(panel, 1)
         return page
 
     def _settings_page(self):
         page, layout = self._page()
-        layout.addLayout(page_header("Settings", "Configure monitoring and data usage."))
+        layout.addLayout(page_header("Settings", "Heartbeat interval and data usage."))
         panel = card()
         p = QVBoxLayout(panel)
         p.setContentsMargins(24, 22, 24, 22)
         p.setSpacing(14)
-        p.addWidget(label("Monitoring", "h2"))
+        p.addWidget(label("Heartbeat", "h2"))
         form = QFormLayout()
         form.setHorizontalSpacing(24)
-        form.setVerticalSpacing(14)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
-        self.size_spin = QSpinBox()
-        self.size_spin.setRange(1, 500)
-        self.size_spin.setValue(25)
-        self.size_spin.setSuffix(" MB")
-        self.size_spin.setFixedWidth(180)
         self.interval_spin = QSpinBox()
-        self.interval_spin.setRange(5, 3600)
-        self.interval_spin.setValue(5)
+        self.interval_spin.setRange(5, 600)
+        self.interval_spin.setValue(DEFAULT_INTERVAL_S)
         self.interval_spin.setSuffix(" s")
         self.interval_spin.setFixedWidth(180)
-        form.addRow(label("Download test size", "muted"), self.size_spin)
-        form.addRow(label("Interval between tests", "muted"), self.interval_spin)
+        form.addRow(label("Heartbeat interval", "muted"), self.interval_spin)
         p.addLayout(form)
         self.usage_label = label("", "muted", wrap=True)
         p.addWidget(self.usage_label)
-        self.size_spin.valueChanged.connect(self._update_usage)
+        p.addWidget(label(
+            "Each heartbeat is a single GET request to the server root, which returns a "
+            "109-byte page. The 25 MB /download speed-test endpoint is never used for "
+            "monitoring. Measured on all four ISP servers: a connection is closed after about "
+            f"{SERVER_IDLE_TIMEOUT_S:.0f} s without traffic, and after about "
+            f"{SERVER_MAX_CONNECTION_AGE_S:.0f} s in total even when heartbeats keep it busy. "
+            f"Below {SERVER_IDLE_TIMEOUT_S:.0f} s, one connection carries about a minute of "
+            "heartbeats and is then replaced automatically. Longer intervals send fewer requests, "
+            "but every heartbeat needs a new connection (about 6 KB with the TLS handshake).",
+            "muted", wrap=True))
+        p.addWidget(label("Keeping a connection open does not make your internet faster.",
+                          "muted", wrap=True))
         self.interval_spin.valueChanged.connect(self._update_usage)
         self._update_usage()
         p.addWidget(label("Changes apply the next time you start monitoring.", "muted"))
@@ -576,196 +521,233 @@ class MainWindow(QMainWindow):
         layout.addStretch()
         return page
 
+    # ── Prefs ────────────────────────────────────────────────────────────────
+    def _load_prefs(self):
+        try:
+            isp = db.get_pref("isp_selection", AUTO)
+            iv = int(db.get_pref("interval_s", str(DEFAULT_INTERVAL_S)))
+        except Exception:
+            isp, iv = AUTO, DEFAULT_INTERVAL_S
+        if isp in (AUTO, *SUPPORTED_ISPS):
+            self.isp_combo.setCurrentText(isp)
+        self.interval_spin.setValue(iv)
+        self.isp_combo.currentTextChanged.connect(lambda v: self._save_pref("isp_selection", v))
+        self.interval_spin.valueChanged.connect(lambda v: self._save_pref("interval_s", str(v)))
+
+    def _save_pref(self, key, value):
+        try:
+            db.set_pref(key, value)
+        except Exception as exc:
+            self.status_label.setText(f"Could not save setting: {exc}")
+
     # ── Navigation ───────────────────────────────────────────────────────────
     def _go_to(self, idx):
         if idx == 1:
             self.refresh_history()
+        elif idx == 2:
+            self.refresh_events()
         self.pages.setCurrentIndex(idx)
 
     def _update_usage(self):
-        size = self.size_spin.value()
-        per_hour = size * 3600 / self.interval_spin.value()  # upper bound, ignores test time
+        iv = self.interval_spin.value()
+        per_hour = estimate_per_hour(iv)
+        mode = ("keeps each connection open until the server's ~60 s limit"
+                if iv < SERVER_IDLE_TIMEOUT_S else "reconnects on every heartbeat")
         self.usage_label.setText(
-            f"Worst case data use: up to ~{per_hour / 1000:.1f} GB per hour "
-            f"({size} MB every {self.interval_spin.value()} s).")
+            f"Estimated data use at {iv} s: about {fmt_bytes(per_hour)} per hour "
+            f"({fmt_bytes(per_hour * 24)} per day). This interval {mode}.")
 
     # ── ISP detection ────────────────────────────────────────────────────────
-    def detect_isp(self):
+    def detect_isp(self, force=False):
         if self.detect_worker and self.detect_worker.isRunning():
             return
         self.detect_button.setEnabled(False)
-        self.status_label.setText("Detecting public IP and ISP…")
-        self.detect_worker = DetectWorker(self)
+        self.status_label.setText("Detecting ISP…")
+        self.detect_worker = DetectWorker(self, force=force)
         self.detect_worker.done.connect(self._apply_isp_info)
-        self.detect_worker.failed.connect(self._show_error)
-        self.detect_worker.finished.connect(self._detect_finished)
+        self.detect_worker.failed.connect(self._detect_failed)
+        self.detect_worker.finished.connect(
+            lambda: self.detect_button.setEnabled(not self._running()))
         self.detect_worker.start()
 
-    def _detect_finished(self):
-        self.detect_button.setEnabled(not (self.worker and self.worker.isRunning()))
-
     def _apply_isp_info(self, info):
-        ip = info.get("ip", "—")
-        org = info.get("organization", "Not available")
-        loc = ", ".join(x for x in (info.get("city"), info.get("country")) if x)
-        self.ip_tile.value.setText(ip)
-        self.ip_tile.detail.setText(loc or "Location unavailable")
-        self.org_tile.value.setText(org)
-        detected = info.get("isp", "Unknown")
-        if detected != "Unknown":
-            self.isp_tile.value.setText(detected)
-            self.isp_tile.detail.setText("Automatically detected")
-            if not (self.worker and self.worker.isRunning()):
-                self.status_label.setText(f"Detected {detected}. You can start monitoring.")
+        detected = info.get("isp", UNKNOWN)
+        org = info.get("organization", "")
+        src = "cached" if info.get("cached") else "detected"
+        self._detected_isp = detected if detected in SERVERS else None
+        if self._detected_isp:
+            self.t_isp.value.setText(detected)
+            self.t_isp.detail.setText(f"Auto {src} · {org}")
+            self.status_label.setText(f"ISP {src}: {detected} ({org}).")
         else:
-            self.isp_tile.value.setText("Unknown")
-            self.isp_tile.detail.setText("Not recognised — choose manually")
-            if not (self.worker and self.worker.isRunning()):
-                self.status_label.setText("Could not recognise your ISP. Select it manually.")
+            self.t_isp.value.setText("Unknown")
+            self.t_isp.detail.setText(org or "Not recognised")
+            self.status_label.setText(
+                f"Could not match \"{org}\" to a supported ISP. Select your ISP manually.")
+        if self._pending_start:
+            self._pending_start = False
+            if self._detected_isp:
+                self._start_keeper(self._detected_isp)
+            else:
+                self._set_controls(running=False)
+                QMessageBox.information(self, "Select ISP",
+                                        f"Your network (\"{org}\") is not one of the supported "
+                                        "ISPs. Please choose your ISP manually.")
 
-    def _show_error(self, message):
-        self.status_label.setText(message)
-        QMessageBox.warning(self, "Network error", message)
+    def _detect_failed(self, message):
+        self.status_label.setText(message + " Select your ISP manually.")
+        if self._pending_start:
+            self._pending_start = False
+            self._set_controls(running=False)
+            QMessageBox.warning(self, "ISP detection failed",
+                                message + "\n\nSelect your ISP manually and start again.")
 
     # ── Monitoring ───────────────────────────────────────────────────────────
+    def _running(self):
+        return bool(self.controller and self.controller.is_running())
+
+    def _set_controls(self, running):
+        self.start_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
+        self.isp_combo.setEnabled(not running)
+        self.detect_button.setEnabled(not running)
+        self.interval_spin.setEnabled(not running)
+
     def start_monitoring(self):
-        if self.worker and self.worker.isRunning():
+        if self._running() or self._pending_start:
             return
-        self.worker = MonitorWorker(
-            self.isp_combo.currentText(), self.size_spin.value(), self.interval_spin.value())
-        self.worker.status.connect(self.status_label.setText)
-        self.worker.isp_info.connect(self._apply_isp_info)
-        self.worker.test_started.connect(self._test_started)
-        self.worker.progress.connect(self._update_progress)
-        self.worker.test_result.connect(self._test_completed)
-        self.worker.error.connect(self._worker_error)
-        self.worker.waiting.connect(self._start_countdown)
-        self.worker.finished.connect(self._monitor_finished)
-        for w in (self.start_button, self.isp_combo, self.detect_button):
-            w.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.badge.set_state("MONITORING", GOOD)
-        self.worker.start()
+        self._set_controls(running=True)
+        self.stop_button.setEnabled(False)
+        choice = self.isp_combo.currentText()
+        if choice == AUTO:
+            self._pending_start = True
+            self.detect_isp(force=False)
+        else:
+            self.t_isp.value.setText(choice)
+            self.t_isp.detail.setText("Selected manually")
+            self._start_keeper(choice)
+
+    def _start_keeper(self, isp):
+        server = SERVERS[isp]
+        self.live_table.setRowCount(0)
+        self.controller = KeeperController(server, self.interval_spin.value(), self)
+        self.controller.event.connect(self._on_event)
+        self.controller.state_changed.connect(self._on_state)
+        self.controller.finished.connect(self._monitor_finished)
+        self.server_label.setText(f"Server: {server.host}:{server.port}")
+        self._set_controls(running=True)
+        self.controller.start()
+        self._tick.start()
+        self.status_label.setText(
+            f"Monitoring {isp}: heartbeat every {self.interval_spin.value()} s "
+            f"({SERVERS[isp].heartbeat_method} /).")
 
     def stop_monitoring(self):
-        if self.worker and self.worker.isRunning():
-            self.worker.stop()
-            self._tick.stop()
+        if self.controller and self._running():
             self.stop_button.setEnabled(False)
             self.badge.set_state("STOPPING", WARN)
-            self.status_label.setText("Stopping monitoring…")
+            self.controller.stop()
 
     def _monitor_finished(self):
         self._tick.stop()
-        for w in (self.start_button, self.isp_combo, self.detect_button):
-            w.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.badge.set_state("IDLE", WARN)
-        if self.test_state.text().endswith("%") or "next test" in self.test_state.text() \
-                or "retrying" in self.test_state.text():
-            self.test_state.setText("Stopped")
+        self._set_controls(running=False)
+        self._refresh_live()
+        self.status_label.setText("Monitoring stopped.")
         if self._closing:
             QTimer.singleShot(0, self.close)
 
-    def _test_started(self, isp):
-        self._tick.stop()
-        self._last_failed = False
-        self.badge.set_state("MONITORING", GOOD)
-        self.progress.setValue(0)
-        self.test_state.setText(f"Testing {isp}…")
+    def _on_state(self, state):
+        colors = {State.CONNECTED.value: GOOD, State.CONNECTING.value: WARN,
+                  State.RECONNECTING.value: BAD, State.STOPPED.value: MUTED}
+        self.badge.set_state(state.upper(), colors.get(state, MUTED))
+        self.state_label.setText(state)
+        self.state_label.setStyleSheet(f"color:{colors.get(state, TEXT)};")
 
-    def _update_progress(self, received, total):
-        percent = min(100, int(received * 100 / max(total, 1)))
-        self.progress.setValue(percent)
-        self.test_state.setText(
-            f"{received / 1_000_000:.1f} / {total / 1_000_000:.0f} MB  ·  {percent}%")
-
-    def _test_completed(self, result):
-        self.speed_value.setText(f"{result['mbps']:.2f}")
-        self.speed_detail.setText(
-            f"{result['isp']} · {result['bytes'] / 1_000_000:.1f} MB in {result['seconds']:.1f} s")
-        self.isp_tile.value.setText(result["isp"])
-        self.progress.setValue(100)
-        self.test_state.setText("Completed")
-        self.refresh_history()
-
-    def _worker_error(self, message):
-        self.status_label.setText(message)
-        self._last_failed = True
-        self.test_state.setText("Failed")
-        self.badge.set_state("ERROR — RETRYING", BAD)
-
-    def _start_countdown(self, seconds):
-        self._countdown = seconds
-        self._tick.start()
-        self._on_tick(initial=True)
-
-    def _on_tick(self, initial=False):
-        if not initial:
-            self._countdown -= 1
-        if self._countdown <= 0:
-            self._tick.stop()
-            return
-        if self._last_failed:
-            self.test_state.setText(f"Failed · retrying in {self._countdown}s")
+    def _on_event(self, e):
+        if e.kind == "heartbeat" and self.live_table.rowCount() and \
+                self.live_table.item(0, 1).text() == "heartbeat":
+            # collapse consecutive heartbeats into one updating row
+            self.live_table.item(0, 0).setText(fmt_ts(e.at, short=True))
+            self.live_table.item(0, 2).setText(e.message)
         else:
-            self.test_state.setText(f"Completed · next test in {self._countdown}s")
+            self.live_table.insertRow(0)
+            for col, v in enumerate((fmt_ts(e.at, short=True), e.kind, e.message)):
+                self.live_table.setItem(0, col, QTableWidgetItem(v))
+            if self.live_table.rowCount() > 200:
+                self.live_table.removeRow(200)
+        self._refresh_live()
 
-    # ── History ──────────────────────────────────────────────────────────────
+    def _refresh_live(self):
+        now = time.time()
+        if not self.controller:
+            self.t_today.value.setText(self._usage_24h())
+            return
+        s = self.controller.keeper.snapshot()
+        running = self._running()
+        self.conn_age_label.setText(fmt_duration(now - s.connection_since)
+                                    if s.connection_since and running else "—")
+        self.session_label.setText(f"Monitoring time: {fmt_duration(now - s.started_at)}"
+                                   if running else "Monitoring time: stopped")
+        if s.last_ok_at:
+            self.t_last.value.setText(fmt_ts(s.last_ok_at, short=True))
+            self.t_last.detail.setText(f"{fmt_duration(now - s.last_ok_at)} ago · "
+                                       f"{s.last_rtt_ms:.0f} ms")
+        avg = s.avg_rtt_ms
+        self.t_rtt.value.setText(f"{avg:.0f} ms" if avg is not None else "—")
+        self.t_rtt.detail.setText(f"Last {s.last_rtt_ms:.0f} ms" if s.last_rtt_ms else "—")
+        self.t_beats.value.setText(str(s.heartbeats_ok))
+        self.t_beats.detail.setText(f"{s.heartbeats_failed} failed")
+        self.t_reconn.value.setText(str(s.reconnects))
+        self.t_reconn.detail.setText(f"{s.reused} requests on a reused connection")
+        self.t_data.value.setText(fmt_bytes(s.bytes_total))
+        self.t_data.detail.setText(f"↑ {fmt_bytes(s.bytes_tx)}  ↓ {fmt_bytes(s.bytes_rx)}")
+        rate = s.bytes_per_hour(now)
+        self.t_rate.value.setText(fmt_bytes(rate) if rate is not None else "—")
+        if int(now) % 15 == 0 or not running:
+            self.t_today.value.setText(self._usage_24h())
+
+    def _usage_24h(self):
+        try:
+            return fmt_bytes(db.usage_totals(time.time() - 86400))
+        except Exception:
+            return "—"
+
+    # ── History / events ─────────────────────────────────────────────────────
     def refresh_history(self):
         try:
-            rows = recent_tests(100)
+            rows = db.recent_sessions(200)
         except Exception as exc:
             self.status_label.setText(f"Could not read history: {exc}")
             return
+        fill_table(self.history_table, [
+            (fmt_ts(start), fmt_duration((end or time.time()) - start), isp, ok, failed,
+             max(0, conns - 1), fmt_bytes(nbytes), f"{rtt:.0f} ms" if rtt else "—")
+            for start, end, isp, ok, failed, conns, nbytes, rtt in rows])
 
-        self.history_table.setRowCount(len(rows))
-        self.history_table.setVisible(bool(rows))
-        self.history_empty.setVisible(not rows)
-        for r, (tested_at, isp, speed, nbytes, secs, *_) in enumerate(rows):
-            values = [fmt_time(tested_at), isp, f"{speed:.2f} Mbps",
-                      f"{nbytes / 1_000_000:.1f} MB", f"{secs:.1f} s"]
-            for c, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if c == 2:
-                    f = item.font()
-                    f.setBold(True)
-                    item.setFont(f)
-                self.history_table.setItem(r, c, item)
-
-        recent = list(reversed(rows[:30]))
-        self.chart.set_points([(fmt_time(t, short=True), s, i) for t, i, s, *_ in recent])
-        if rows:
-            speeds = [row[2] for row in rows[:30]]
-            self.stats_label.setText(
-                f"Last {len(speeds)} tests\n"
-                f"Avg {sum(speeds) / len(speeds):.1f}  ·  "
-                f"Min {min(speeds):.1f}  ·  Max {max(speeds):.1f} Mbps")
-            if self.speed_value.text() == "—":
-                t, isp, speed, nbytes, secs, _ = rows[0]
-                self.speed_value.setText(f"{speed:.2f}")
-                self.speed_detail.setText(f"{isp} · {fmt_time(t)}")
-        else:
-            self.stats_label.setText("")
+    def refresh_events(self):
+        try:
+            rows = db.recent_events(500)
+        except Exception as exc:
+            self.status_label.setText(f"Could not read events: {exc}")
+            return
+        fill_table(self.events_table, [(fmt_ts(at), kind, msg) for at, kind, msg in rows])
 
     def _clear_history(self):
         if QMessageBox.question(self, "Clear history",
-                                "Delete all recorded tests? This cannot be undone.") \
+                                "Delete all sessions and events? This cannot be undone.") \
                 != QMessageBox.StandardButton.Yes:
             return
-        clear_history()
-        self.speed_value.setText("—")
-        self.speed_detail.setText("No completed test yet")
+        db.clear_history()
         self.refresh_history()
+        self._refresh_live()
 
     # ── Shutdown ─────────────────────────────────────────────────────────────
     def closeEvent(self, event):
-        if self.worker and self.worker.isRunning():
-            # The worker aborts its download promptly; close once it finishes.
+        if self._running():
             self._closing = True
             self.stop_monitoring()
             event.ignore()
             return
         if self.detect_worker and self.detect_worker.isRunning():
-            self.detect_worker.wait(11000)  # detection has a 10 s timeout
+            self.detect_worker.wait(11000)
         event.accept()

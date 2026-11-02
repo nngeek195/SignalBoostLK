@@ -1,6 +1,37 @@
 {
-  "Mobitel": "https://speedtest2.mobitel.lk.prod.hosts.ooklaserver.net:8080",
-  "Dialog": "https://ookla1.dialog.lk.prod.hosts.ooklaserver.net:8080",
-  "SLT": "https://hqspeedtest1.slt.lk.prod.hosts.ooklaserver.net:8080",
-  "Hutch": "https://wplsp.hutch.lk.prod.hosts.ooklaserver.net:8080"
+  "schema_version": 2,
+  "isps": {
+    "Mobitel": {
+      "display_name": "SLT-Mobitel (Mobile)",
+      "host": "speedtest2.mobitel.lk.prod.hosts.ooklaserver.net",
+      "port": 8080,
+      "heartbeat": { "method": "GET", "path": "/" },
+      "speedtest_path": "/download",
+      "org_patterns": ["mobitel"]
+    },
+    "Dialog": {
+      "display_name": "Dialog Axiata",
+      "host": "ookla1.dialog.lk.prod.hosts.ooklaserver.net",
+      "port": 8080,
+      "heartbeat": { "method": "GET", "path": "/" },
+      "speedtest_path": "/download",
+      "org_patterns": ["dialog", "axiata"]
+    },
+    "SLT": {
+      "display_name": "Sri Lanka Telecom (SLT)",
+      "host": "hqspeedtest1.slt.lk.prod.hosts.ooklaserver.net",
+      "port": 8080,
+      "heartbeat": { "method": "GET", "path": "/" },
+      "speedtest_path": "/download",
+      "org_patterns": ["sri lanka telecom", "slt"]
+    },
+    "Hutch": {
+      "display_name": "Hutch",
+      "host": "wplsp.hutch.lk.prod.hosts.ooklaserver.net",
+      "port": 8080,
+      "heartbeat": { "method": "GET", "path": "/" },
+      "speedtest_path": "/download",
+      "org_patterns": ["hutch", "hutchison"]
+    }
+  }
 }

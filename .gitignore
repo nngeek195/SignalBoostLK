@@ -5,3 +5,6 @@ build/
 dist/
 *.spec
 .DS_Store
+
+# build outputs — publish via GitHub Releases, never commit
+/*.deb

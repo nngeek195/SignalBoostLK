@@ -11,7 +11,8 @@ CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "isps.json"
 def load_servers() -> dict:
     """Load ISP -> Ookla server base URL mapping from app/config/isps.json."""
     with open(CONFIG_PATH, encoding="utf-8") as fh:
-        return {str(k): str(v).rstrip("/") for k, v in json.load(fh).items()}
+        isps = json.load(fh)["isps"]
+    return {name: f"https://{cfg['host']}:{int(cfg['port'])}" for name, cfg in isps.items()}
 
 
 SERVERS = load_servers()

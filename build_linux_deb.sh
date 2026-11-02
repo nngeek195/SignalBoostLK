@@ -1,9 +1,8 @@
-
 #!/usr/bin/env bash
 set -euo pipefail
 
 APP_NAME="signalboostlk"
-VERSION="0.1.0"
+VERSION="2.0.0"
 ARCH="amd64"
 
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -56,7 +55,7 @@ cat > "$PACKAGE_DIR/usr/share/applications/signalboostlk.desktop" <<'EOF'
 Version=1.0
 Type=Application
 Name=SignalBoostLK
-Comment=ISP Monitor and Download Speed Tester
+Comment=Lightweight ISP connection keeper for Sri Lankan ISPs
 Exec=/usr/bin/signalboostlk
 Icon=network-wireless
 Terminal=false
@@ -73,8 +72,9 @@ Priority: optional
 Architecture: $ARCH
 Maintainer: Niranga Nayanajith
 Depends: libc6, libstdc++6, libgl1, libxkbcommon0, libxcb-cursor0
-Description: SignalBoostLK ISP Monitor
- Monitor Sri Lankan ISPs and perform ISP-specific download tests.
+Description: SignalBoostLK ISP connection keeper
+ Keeps a lightweight HTTPS connection to the selected Sri Lankan ISP's
+ Ookla server and reconnects when it closes. Does not run speed tests.
 EOF
 
 dpkg-deb --build --root-owner-group \
